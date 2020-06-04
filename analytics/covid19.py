@@ -1,10 +1,14 @@
 import os
 import requests
 
+from statsmodels.tsa.stattools import adfuller as ADF
 import pandas as pd
 import numpy as np
+import datetime
+from sklearn.linear_model import LinearRegression
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), '../data/')
+# DATA_DIR = os.path.join(os.path.dirname(__file__), '../data/')
+DATA_DIR = r'C:\Users\86139\Desktop\西北大学\CS338\Project\Say-It\analytics\data'
 BASE_URL = 'https://api.census.gov/data/2019/pep/population'
 API_KEY = 'ff51fda390a45a5085af02b99725c2963edf7931'
 
@@ -19,6 +23,29 @@ class Covid19(object):
     def __str__(self):
         return 'us: {}\nus-states: {}\nus-counties: {}'.format(
             self.df_us.shape, self.df_states.shape, self.df_counties.shape)
+
+    """
+    Test if the input is valid
+    """
+    def valid_span(self, date, state=None, county=None, span=1):
+        df = self.df_us.copy()
+        if state:
+            df = self.df_states.copy()
+            df = df[df['state'] == state]
+        if state and county:
+            df = self.df_counties.copy()
+            df = df[(df['state'] == state) & (df['county'] == county)]
+        df = df.reset_index(drop=True)
+        idx = pd.Index(df['date']).get_loc(date)
+
+        # 'Error, please input the right date.\n'
+        if idx - 1 <= 0:
+            return False
+        # 'Error. The span is out of the range of dataset.\n'
+        if idx - 2 * span <= 0:
+            return False
+        # Valid
+        return True
 
     """
     Confirmed cases related
@@ -87,7 +114,6 @@ class Covid19(object):
         prev_date = prev_dt.strftime('%Y-%m-%d')
 
         return 'increase' if self.confirmed_cases(date, state, county, span) > self.confirmed_cases(prev_date, state, county, span) else 'decrease'
-
 
     """
         Death cases related
@@ -186,6 +212,7 @@ class Covid19(object):
             return 'increase' if thisweek_death_rate > lastweek_death_rate else 'decrease'
         else:
             return 'Scale should be either day or week.\n'
+
     """
     Rank related
     """
@@ -227,6 +254,7 @@ class Covid19(object):
             df = self.df_counties.copy()
             df = df[df['state'] == state]
         df = df[df['date'] == date]
+        df = df.reset_index(drop=True)
 
         idx = df['cases'].idxmax()
         if state:
@@ -262,6 +290,150 @@ class Covid19(object):
 
         return rank
 
+    def rank_among_peers(self, date, attribute, state, county=None, scale='cumulative'):
+        """
+        Get rank among peers. If rank <= 10, return at most three peer in front of it, otherwise return top 3.
+        :param date: str, e.g. '2020-04-23'
+        :param attribute: str, e.g. 'cases' or 'deaths'
+        :param state: str, e.g. 'Illinois'
+        :param county: str, e.g. 'Cook'
+        :param scale: str, 'new' or 'cumulative'
+        :return: dict, e.g. {'rank': 1, 'aboves': ['Illinois', 'California'], 'tops': ['New York', 'Illinois', 'California']}
+        """
+        df = self.df_states.copy()
+        if county:
+            df = self.df_counties.copy()
+            df = df[df['state'] == state]
+
+        data_list, ranks = [], []
+        if scale == 'cumulative':
+            df = df[df['date'] == date]
+            df.sort_values(by=[attribute], inplace=True, ascending=False)
+            ranks = df['county'].to_list() if county else df['state'].to_list()
+            for idx, row in df.iterrows():
+                data_list.append((row['county'] if county else row['state'], row[attribute]))
+        elif scale == 'new':
+            peers = df['county'].unique() if county else df['state'].unique()
+
+            today = datetime.datetime.strptime(date, '%Y-%m-%d')
+            yesterday = (today - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+            today = date
+
+            data_list = []
+            for peer in peers:
+                data_today = df[(df['date'] == today) & (df['county'] == peer)] if county else df[(df['date'] == today) & (df['state'] == peer)]
+                data_yesterday = df[(df['date'] == yesterday) & (df['county'] == peer)] if county else df[(df['date'] == yesterday) & (df['state'] == peer)]
+
+                newly = data_today.iloc[0][attribute] - data_yesterday.iloc[0][attribute] if not data_yesterday.empty else 0  # no newly case
+                data_list.append((peer, newly))
+            data_list = sorted(data_list, key=lambda x: x[1], reverse=True)
+            ranks = [peer for peer, newly in data_list]
+
+        rank = ranks.index(county if county else state)
+        # aboves = ranks[rank - 2 if rank >= 2 else 0: rank] if rank < 10 else ranks[0: 2]
+        aboves = data_list[max(rank - 3, 0): rank]
+        tops = data_list[0: min(len(data_list), 3)]
+
+        for i in range(len(aboves), 3):
+            aboves.insert(0, ('', 0))
+        for i in range(len(tops), 3):
+            tops.insert(0, ('', 0))
+
+        return {'rank': rank + 1, 'aboves': aboves, 'tops': tops}
+
+    def trend_description(self, date, attribute, state, county=None, scale='cumulative'):
+        """
+        Describe the trend
+        :param date: str, e.g. '2020-04-23'
+        :param attribute: str, e.g. 'cases' or 'deaths'
+        :param state: str, e.g. 'Illinois'
+        :param county: str, e.g. 'Cook'
+        :param scale: str, 'new' or 'cumulative'
+        :return: str, a sentence
+        """
+
+        df = self.df_states.copy()
+        df = df[df['state'] == state]
+        if county:
+            df = self.df_counties.copy()
+            df = df[(df['state'] == state) & (df['county'] == county)]
+        df = df.set_index(df['date']).truncate(after=date)
+
+        input_data = np.array(df[attribute])
+        if scale == 'new':
+            df['new'] = df[attribute].shift(-1) - df[attribute]
+            df['new'] = df['new'].shift(-1)
+            input_data = np.array(df['new'][:-2].values)
+
+        if input_data.size < 13:
+            return ""
+        lastest = input_data[-12:]
+        std_lastest = (lastest - np.min(lastest)) / (np.max(lastest) - np.min(lastest))
+        # print(std_lastest)
+        today = std_lastest[-1]
+        last_ten = std_lastest[:10]
+        index = np.arange(10)
+
+        reg = LinearRegression().fit(index.reshape(-1, 1), last_ten.reshape(-1, 1))
+        intercept = last_ten - reg.coef_ * index
+        max_value = reg.coef_ * 11 + np.max(intercept)
+        min_value = reg.coef_ * 11 + np.min(intercept)
+
+        if reg.coef_ > 0.05:
+            sign1 = "in a rising channel"
+        elif reg.coef_ < -0.05:
+            sign1 = "in a descending channel"
+        else:
+            ave = np.mean(lastest[:10])
+            sign1 = "fluctuating around %d cases" % ave
+
+        sentence1 = "Based on the data from the past ten days, %s %s of this region is %s " % (scale, attribute, sign1)
+
+        if min_value <= today <= max_value:
+            sentence2 = "and there is no sign of breakthrough."
+        elif today < min_value:
+            sentence2 = "and today's data shows a sign of downward breakthrough."
+        else:
+            sentence2 = "and today's data shows a sign of upward breakthrough."
+
+        return sentence1 + sentence2
+
+        # Total trend
+        # n = input_data.shape[0]
+        # sum_sgn = 0
+        # for i in np.arange(n):
+        #     if i <= (n - 1):
+        #         for j in np.arange(i + 1, n):
+        #             if input_data[j] > input_data[i]:
+        #                 sum_sgn = sum_sgn + 1
+        #             elif input_data[j] < input_data[i]:
+        #                 sum_sgn = sum_sgn - 1
+        #             else:
+        #                 sum_sgn = sum_sgn
+        # if n <= 10:
+        #     z_value = sum_sgn / (n * (n - 1) / 2)
+        # else:
+        #     if sum_sgn > 0:
+        #         z_value = (sum_sgn - 1) / np.sqrt(n * (n - 1) * (2 * n + 5) / 18)
+        #     elif sum_sgn == 0:
+        #         z_value = 0
+        #     else:
+        #         z_value = (sum_sgn + 1) / np.sqrt(n * (n - 1) * (2 * n + 5) / 18)
+        # ADF_result = ADF(input_data, 0)
+        # # 99% ——> +—2.576
+        # # 95% ——> +—1.96
+        # # 90% ——> +—1.645
+        # if ADF_result[1] < 0.01:
+        #     result = 'remaining relatively stable'
+        # else:
+        #     if 1.96 < np.abs(z_value) <= 2.576:
+        #         result = 'rising' if z_value > 0 else 'descending'
+        #     elif np.abs(z_value) > 2.576:
+        #         result = 'significantly rising' if z_value > 0 else 'significantly descending'
+        #     else:
+        #         result = 'fluctuating'
+        # return result
+
     """
     Additional Data needed
     """
@@ -279,28 +451,6 @@ class Covid19(object):
         confirmed_cases = self.confirmed_cases(date=date, state=state, county=county, span=span)[0]
 
         return round(confirmed_cases / population * scale, 1)
-
-    def cure_rate(self, date, state=None, county=None, span=1):
-        """
-        Cure rate for today or this week
-        :param date: str, e.g. '2020-04-23'
-        :param state: str, e.g. 'Illinois'
-        :param county: str, e.g. 'Cook'
-        :param span: int, e.g. 1 for today, 7 for this week
-        :return: float
-        """
-        raise NotImplementedError
-
-    def cure_rate_comparison(self, date, state=None, county=None, scale='day'):
-        """
-        Compare cure rate between today/yesterday, this week/last week
-        :param date: str, e.g. '2020-04-23'
-        :param state: str, e.g. 'Illinois'
-        :param county: str, e.g. 'Cook'
-        :param scale: 'day' or 'week'
-        :return: 'increase' or 'decrease'
-        """
-        raise NotImplementedError
 
     def most_confirmed_cases_per_capita(self, date, state=None, scale=100000, span=999, type='most'):
         """
@@ -328,7 +478,7 @@ class Covid19(object):
         if type == 'most':
             result = max(zip(cases_per_capita.values(), cases_per_capita.keys()))
         else:
-            non_zeros = {k: v for k, v in cases_per_capita.items() if v != 0.0}
+            non_zeros = {k: v for k, v in cases_per_capita.items() if v > 0.0}
             result = min(zip(non_zeros.values(), non_zeros.keys()))
         return result
 
@@ -362,3 +512,44 @@ class Covid19(object):
             return sys.maxsize * 2 + 1
         data = response.json()
         return int(data[1][0])
+
+    def ending_main(self, date, state, attribute='cases'):
+        """
+        Return some data used in the ending paragraph
+        :param date: str, e.g. '2020-04-23'
+        :param state: str, e.g. 'Illinois'
+        :param attribute: str, e.g. 'cases' or 'deaths'
+        :return:
+        """
+        df = self.df_counties.copy()
+        df = df[df['state'] == state]
+        df = df.reset_index(drop=True)
+
+        peers = df['county'].unique()
+
+        today = datetime.datetime.strptime(date, '%Y-%m-%d')
+        yesterday = (today - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+        today = date
+
+        data_list = []
+        total_newly = 0
+        for peer in peers:
+            data_today = df[(df['date'] == today) & (df['county'] == peer)]
+            data_yesterday = df[(df['date'] == yesterday) & (df['county'] == peer)]
+
+            newly = data_today.iloc[0][attribute] - data_yesterday.iloc[0][attribute] if not data_yesterday.empty else 0
+            if newly > 0:
+                total_newly += newly
+                data_list.append((peer, newly))
+        data_list = sorted(data_list, key=lambda x: x[1], reverse=True)
+
+        if len(data_list) < 3:
+            raise IndexError
+        county1, county1_new = data_list[0]
+        county2, county2_new = data_list[1]
+        county3, county3_new = data_list[-1]
+
+        return {'county1': county1, 'county1_new': county1_new,
+                'county2': county2, 'county2_new': county2_new,
+                'county3': county3, 'county3_new': county3_new,
+                'total': total_newly}
